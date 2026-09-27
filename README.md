@@ -92,9 +92,11 @@ Here is a detailed explanation of all available arguments:
     The total number of CPU processes to spawn for the I/O-bound task of writing image files to disk. By default, it uses all available CPU cores to maximize I/O throughput.  
     (Default: Your system's CPU core count)
 
-* **`--debug`** A flag that, if present, will save two intermediate images for each detected watermark into an `output/debug/` directory:
+* **`--debug`** A flag that, if present, will save two intermediate images for each detected watermark into an `output/debug/` directory, named after the full input file name (for example `photo.jpg_mask_raw.png`):
     1.  `_mask_raw.png`: The raw black and white mask.
     2.  `_mask_preview.png`: The mask overlaid in semi-transparent red on the original image.
+
+* **`--png`** A flag that, if present, saves every output image as lossless PNG, regardless of the input format. `photo.jpg` is written as `photo.png`. When several images in one folder would get the same PNG name (for example `photo.jpg`, `photo.png` and `photo.webp`), a PNG source keeps its name and the others keep their extension: `photo.jpg.png`, `photo.webp.png`. Names are compared without case, as on Windows.
 
 * **`--skip-clean`** `on|off`  
     Controls what happens to images in which no watermark is detected. `on`, `yes` or `1` does not write them to the output folder. `off`, `no` or `0` writes them too, so the output folder is a complete copy of the input. JPEG and WebP files are then copied byte for byte, so they lose no quality. Lossless sources (PNG, BMP, TIFF) are re-encoded, and with `--png` every file is re-encoded to PNG. Images with a watermark are always written. Skipped images are still recorded in `.processing_log.txt`, so a resumed session does not scan them again. To write them later, delete the log file or use a different output folder. `--skip-clean` with no value means `on`.  

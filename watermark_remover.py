@@ -121,6 +121,28 @@ def find_image_files(input_dir: pathlib.Path, recursive: bool, console: Console)
                     image_files.append(item)
                 status.update(f"[bold green]Scanning... Items: {i+1}/{len(all_items)} | Images found: {len(image_files):,}")
     return image_files
+
+def png_output_renames(relative_paths: list) -> dict:
+    """With --png, a.jpg is written as a.png. When several sources would share one PNG name (a.jpg, a.png, a.webp),
+    a PNG source keeps it and the others keep their extension: a.jpg.png, a.webp.png. Names are compared without
+    case, as on Windows. Returns {input-relative posix path: output-relative posix path} for renamed sources only.
+    It is computed from the whole dataset, not only the unprocessed images, so a resumed session picks the same names."""
+    groups = {}
+    for rel in relative_paths: groups.setdefault(rel.with_suffix(".png").as_posix().lower(), []).append(rel)
+    outputs = {}
+    for group in groups.values():
+        for rel in group:
+            keeps_name = len(group) == 1 or rel.suffix.lower() == ".png"
+            outputs[rel] = rel.with_suffix(".png") if keeps_name else rel.with_name(rel.name + ".png")
+    # A name can still repeat in a contrived dataset (a.jpg next to a real a.jpg.png, or a.PNG next to a.png); number those.
+    # Sources that keep their plain name claim it first, so a real a.jpg.png is not displaced by a renamed a.jpg.
+    taken, renames = set(), {}
+    for rel in sorted(outputs, key=lambda r: (outputs[r] != r.with_suffix(".png"), r.as_posix())):
+        out, n = outputs[rel], 2
+        while out.as_posix().lower() in taken: out = outputs[rel].with_name(f"{outputs[rel].stem}_{n}.png"); n += 1
+        taken.add(out.as_posix().lower())
+        if out != rel.with_suffix(".png"): renames[rel.as_posix()] = out.as_posix()
+    return renames
 # ╰─────────────────────────────────────────────────────────────────────────╯
 
 # ╭─────────────────────── Custom Rich Progress Columns ───────────────────────╮
@@ -158,7 +180,7 @@ def gpu_worker_process(gpu_id: int, image_paths: list, write_queue: mp.Queue, st
         try:
             relative_path = path.relative_to(args.input)
             output_path = args.output / relative_path
-            if args.png: output_path = output_path.with_suffix(".png")
+            if args.png: output_path = args.output / args.png_renames.get(relative_path.as_posix(), relative_path.with_suffix(".png").as_posix())
             img_bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
             if img_bgr is None:
                 status_queue.put({"type": "log", "message": f"Could not read image: {path}"})
@@ -174,8 +196,9 @@ def gpu_worker_process(gpu_id: int, image_paths: list, write_queue: mp.Queue, st
                     preview_overlay = np.zeros_like(img_bgr); preview_overlay[mask == 255] = [0, 0, 255]
                     mask_preview = cv2.addWeighted(img_bgr, 0.7, preview_overlay, 0.3, 0)
                     debug_dir = args.output / "debug" / relative_path.parent
-                    write_queue.put((debug_dir / f"{path.stem}_mask_raw.png", mask, None))
-                    write_queue.put((debug_dir / f"{path.stem}_mask_preview.png", mask_preview, None))
+                    # Named after the full input name, so a.jpg and a.png in one folder get separate masks.
+                    write_queue.put((debug_dir / f"{path.name}_mask_raw.png", mask, None))
+                    write_queue.put((debug_dir / f"{path.name}_mask_preview.png", mask_preview, None))
                 result_bgr = cv2.cvtColor(np.array(lama_model(Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)), Image.fromarray(mask))), cv2.COLOR_RGB2BGR)
                 write_queue.put((output_path, result_bgr, relative_path.as_posix())); result = "inpainted"
             elif args.skip_clean:
@@ -231,6 +254,10 @@ def main():
         console.print("[bold green]✅ All images have already been processed. Nothing to do.[/bold green]"); sys.exit(0)
 
     console.print(f"[*] Total images in dataset: {len(all_image_paths):,}. New images to process this session: [bold green]{len(images_to_process):,}[/bold green]")
+
+    args.png_renames = png_output_renames([p.relative_to(args.input) for p in all_image_paths]) if args.png else {}
+    if args.png_renames:
+        console.print(f"[*] [yellow]{len(args.png_renames):,}[/] images share a PNG name with another image in the same folder; they keep their extension, e.g. {next(iter(args.png_renames.values()))}")
 
     gpu_ids = get_gpu_ids()
     if not gpu_ids: console.print("[bold red]ERROR: No NVIDIA GPUs detected.[/bold red]"); sys.exit(1)
