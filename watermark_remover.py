@@ -56,8 +56,17 @@ except ImportError:
 # ───────────────────────────────────────────────────────────────────────────────────────────────
 
 IMG_EXTS = ("jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff")
+# Clean images in these formats are copied byte for byte instead of re-encoded (unless --png), so they lose no quality.
+# WebP can also be lossless, but a byte copy is exact either way.
+LOSSY_EXTS = ("jpg", "jpeg", "webp")
 
 # ╭───────────────────────── CLI Argument Parsing ─────────────────────────╮
+def on_off(value: str) -> bool:
+    """argparse type for switches that take on/yes/1 or off/no/0."""
+    if value.strip().lower() in ("on", "yes", "1"): return True
+    if value.strip().lower() in ("off", "no", "0"): return False
+    raise argparse.ArgumentTypeError(f"expected on, yes, 1, off, no or 0, got {value!r}")
+
 def parse_cli_args():
     """Sets up and parses command-line arguments using Python's argparse."""
     parser = argparse.ArgumentParser(
@@ -66,12 +75,14 @@ def parse_cli_args():
     )
     parser.add_argument("-i", "--input", required=True, type=pathlib.Path, help="Path to the folder containing watermarked images.")
     parser.add_argument("-o", "--output", required=True, type=pathlib.Path, help="Path to the folder where clean images will be saved.")
-    parser.add_argument("-w", "--weights", type=pathlib.Path, default=pathlib.Path("yolo11x-train28-best.pt"), help="Path to the YOLOv11 model weights file.")
+    parser.add_argument("-w", "--weights", type=pathlib.Path, default=pathlib.Path("yolo11x-train28-best.pt"), help="Path to the YOLO detector weights (.pt). Supports plain ultralytics checkpoints such as\nyolo11x-train28-best.pt and DINOv3-YOLOv12 checkpoints such as yolov12x-dino3-watermark-detection.pt.")
     parser.add_argument("--conf", type=float, default=0.1, help="YOLO detection confidence threshold.")
     parser.add_argument("--dilate", type=int, default=15, help="Pixel amount to expand detected masks.")
     parser.add_argument("-R", "--recursive", action="store_true", help="Process images in subdirectories recursively.")
     parser.add_argument("--cpu-workers", type=int, default=os.cpu_count(), help="Total number of CPU processes for writing images to disk.")
     parser.add_argument("--debug", action="store_true", help="Save intermediate mask_raw and mask_preview images for debugging.")
+    parser.add_argument("--png", action="store_true", help="Save output images as lossless PNG regardless of the input format.")
+    parser.add_argument("--skip-clean", type=on_off, nargs="?", const=True, default=True, metavar="{on,off}", help="on, yes, 1 (default): do not write images in which no watermark is detected. They are\nstill recorded in the checkpoint log, so a resumed session does not scan them again.\noff, no, 0: write them to the output folder too. JPEG and WebP files are copied unchanged;\nlossless sources, and every file when --png is set, are re-encoded.")
     return parser.parse_args()
 # ╰─────────────────────────────────────────────────────────────────────────╯
 
@@ -136,6 +147,8 @@ def gpu_worker_process(gpu_id: int, image_paths: list, write_queue: mp.Queue, st
     from ultralytics import YOLO
     from simple_lama_inpainting import SimpleLama
     from PIL import Image
+    import dino3_compat  # lets stock ultralytics load DINOv3-YOLOv12 checkpoints; no-op for plain YOLO weights
+    dino3_compat.register()
     try:
         device = torch.device("cuda:0"); yolo_model = YOLO(args.weights).to(device); lama_model = SimpleLama(device=device)
     except Exception as e:
@@ -143,9 +156,13 @@ def gpu_worker_process(gpu_id: int, image_paths: list, write_queue: mp.Queue, st
 
     for path in image_paths:
         try:
+            relative_path = path.relative_to(args.input)
+            output_path = args.output / relative_path
+            if args.png: output_path = output_path.with_suffix(".png")
             img_bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
             if img_bgr is None:
-                status_queue.put({"type": "log", "message": f"Could not read image: {path}"}); continue
+                status_queue.put({"type": "log", "message": f"Could not read image: {path}"})
+                status_queue.put({"type": "gpu_progress", "gpu_id": gpu_id, "result": "failed"}); continue
             predictions = yolo_model(img_bgr, conf=args.conf, verbose=False)[0]
             if len(predictions.boxes.xyxy) > 0:
                 mask = np.zeros(img_bgr.shape[:2], dtype=np.uint8)
@@ -156,33 +173,38 @@ def gpu_worker_process(gpu_id: int, image_paths: list, write_queue: mp.Queue, st
                 if args.debug:
                     preview_overlay = np.zeros_like(img_bgr); preview_overlay[mask == 255] = [0, 0, 255]
                     mask_preview = cv2.addWeighted(img_bgr, 0.7, preview_overlay, 0.3, 0)
-                    relative_path = path.relative_to(args.input)
                     debug_dir = args.output / "debug" / relative_path.parent
-                    write_queue.put((debug_dir / f"{path.stem}_mask_raw.png", mask))
-                    write_queue.put((debug_dir / f"{path.stem}_mask_preview.png", mask_preview))
+                    write_queue.put((debug_dir / f"{path.stem}_mask_raw.png", mask, None))
+                    write_queue.put((debug_dir / f"{path.stem}_mask_preview.png", mask_preview, None))
                 result_bgr = cv2.cvtColor(np.array(lama_model(Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)), Image.fromarray(mask))), cv2.COLOR_RGB2BGR)
+                write_queue.put((output_path, result_bgr, relative_path.as_posix())); result = "inpainted"
+            elif args.skip_clean:
+                result = "skipped"  # nothing to write; the main process logs the file so a resumed session skips it
+            elif path.suffix.lower().lstrip('.') in LOSSY_EXTS and not args.png:
+                write_queue.put((output_path, path, relative_path.as_posix())); result = "copied"
             else:
-                result_bgr = img_bgr
-            write_queue.put((args.output / path.relative_to(args.input), result_bgr))
-            status_queue.put({"type": "gpu_progress", "gpu_id": gpu_id})
+                write_queue.put((output_path, img_bgr, relative_path.as_posix())); result = "reencoded"
+            status_queue.put({"type": "gpu_progress", "gpu_id": gpu_id, "result": result, "key": relative_path.as_posix()})
         except Exception as e:
             status_queue.put({"type": "error", "message": f"Error on GPU {gpu_id} processing {path.name}: {e}"})
+            status_queue.put({"type": "gpu_progress", "gpu_id": gpu_id, "result": "failed"})
 
 def cpu_writer_process(write_queue: mp.Queue, log_queue: mp.Queue, output_dir: pathlib.Path):
     """A dedicated I/O process that saves files and reports success for checkpointing."""
-    import cv2
+    import cv2, shutil
     created_dirs = set()
     while True:
         try:
             item = write_queue.get()
             if item is None: break
-            path, image_array = item
+            path, data, log_key = item  # data is an image array to encode or a source path to copy; log_key is the input-relative path, or None for debug images
             if path.parent not in created_dirs:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 created_dirs.add(path.parent)
-            cv2.imwrite(str(path), image_array)
-            if not str(path).startswith(str(output_dir / "debug")):
-                 log_queue.put(path.relative_to(output_dir).as_posix())
+            if isinstance(data, pathlib.Path): shutil.copy2(data, path); written = True
+            else: written = cv2.imwrite(str(path), data)
+            if written and log_key is not None:
+                log_queue.put(log_key)
         except (KeyboardInterrupt, SystemExit):
             break
         except Exception: continue
@@ -239,18 +261,22 @@ def main():
         SpeedColumn(), "•", EstimatedTimeRemainingColumn(), console=console
     )
     progress_task = progress.add_task("New Images", total=len(images_to_process))
-    gpu_stats = {gpu_id: {'completed': 0, 'start_time': time.time()} for gpu_id in gpu_ids}
+    RESULTS = ("inpainted", "skipped", "copied", "reencoded", "failed")
+    gpu_stats = {gpu_id: {'completed': 0, **dict.fromkeys(RESULTS, 0), 'start_time': time.time()} for gpu_id in gpu_ids}
+    clean_label = "skipped" if args.skip_clean else "written"
 
     def generate_layout():
         gpu_table = Table.grid(expand=True)
         gpu_table.add_column("GPU ID", justify="right", style="cyan", no_wrap=True)
         gpu_table.add_column("Processed", justify="center", style="magenta")
+        gpu_table.add_column("Watermarked", justify="center", style="red")
+        gpu_table.add_column("No watermark", justify="center", style="yellow")
         gpu_table.add_column("Speed (img/s)", justify="center", style="green")
         for gpu_id, stats in gpu_stats.items():
             elapsed = time.time() - stats['start_time']
             rate = stats['completed'] / elapsed if elapsed > 1 else 0.0
-            # THE ONLY CHANGE IS IN THE LINE BELOW: Added " img/s"
-            gpu_table.add_row(f"[bold]GPU {gpu_id}[/]", f"{stats['completed']:,} images", f"{rate:.2f} img/s")
+            clean = stats['skipped'] + stats['copied'] + stats['reencoded']
+            gpu_table.add_row(f"[bold]GPU {gpu_id}[/]", f"{stats['completed']:,} images", f"{stats['inpainted']:,} inpainted", f"{clean:,} {clean_label}", f"{rate:.2f} img/s")
 
         display_grid = Table.grid(padding=(0,0,1,0))
         display_grid.add_row(Panel(gpu_table, title="[bold]GPU Worker Status[/bold]", border_style="green"))
@@ -259,54 +285,77 @@ def main():
 
     log_file = open(log_file_path, "a", encoding="utf-8")
 
-    all_workers = gpu_workers + cpu_writers
+    def drain_log_queue():
+        """Appends every file the CPU writers have finished to the checkpoint log."""
+        try:
+            while True: log_file.write(f"{log_queue.get_nowait()}\n")
+        except queue.Empty:
+            pass
+        log_file.flush()
+
     total_completed = 0
+    interrupted = False
     try:
         with Live(generate_layout(), console=console, screen=True, redirect_stderr=False, vertical_overflow="crop") as live:
             while total_completed < len(images_to_process):
+                # Checked before draining: a worker that has exited has already flushed its last messages into the queue.
+                gpu_workers_done = not any(p.is_alive() for p in gpu_workers)
                 try:
                     while True: # Process all available status messages
                         msg = status_queue.get_nowait()
                         if msg["type"] == "gpu_progress":
                             gpu_stats[msg["gpu_id"]]['completed'] += 1
+                            gpu_stats[msg["gpu_id"]][msg["result"]] += 1
                             total_completed += 1
+                            if msg["result"] == "skipped": log_file.write(f"{msg['key']}\n")
                         elif msg["type"] == "error": console.log(f"❌ [bold red]ERROR:[/bold red] {msg['message']}")
                         elif msg["type"] == "log": console.log(f"⚠️ [yellow]WARNING:[/] {msg['message']}")
                 except queue.Empty:
                     pass
 
-                try:
-                    while True: # Process all available log messages
-                        path_to_log = log_queue.get_nowait()
-                        log_file.write(f"{path_to_log}\n")
-                except queue.Empty:
-                    pass
-
-                log_file.flush()
+                drain_log_queue()
                 progress.update(progress_task, completed=total_completed)
                 live.update(generate_layout())
+                if gpu_workers_done: break  # e.g. a GPU failed to initialize; its images are left for the next session
                 time.sleep(0.1)
 
     except KeyboardInterrupt:
+        interrupted = True
         console.print("\n[!] Pausing session... Please wait for checkpointing to complete.", style="bold yellow")
-    finally:
-        log_file.close()
 
     # --- Clean Shutdown Sequence ---
-    console.print("\n[*] Shutting down all workers...")
-
-    for p in all_workers:
+    # GPU workers are finished (or interrupted); the CPU writers still hold up to one full write queue.
+    # Each writer stops at its None sentinel, so every image queued before it is written and logged.
+    console.print("\n[*] Finishing queued writes and shutting down all workers...")
+    for p in gpu_workers:
+        if interrupted and p.is_alive(): p.terminate()
+        p.join(timeout=30)
         if p.is_alive(): p.terminate()
-    for p in all_workers:
-        if p.is_alive(): p.join(timeout=5)
+    for _ in cpu_writers:
+        try: write_queue.put(None, timeout=5)
+        except queue.Full: break  # writers already stopped by Ctrl+C; the fallback below terminates them
+    deadline = time.time() + (10 if interrupted else 300)
+    while any(p.is_alive() for p in cpu_writers) and time.time() < deadline:
+        drain_log_queue()  # keeps the log pipe empty, so no writer blocks on exit
+        for p in cpu_writers: p.join(timeout=0.05)
+    for p in cpu_writers:
+        if p.is_alive(): p.terminate(); p.join(timeout=5)
+    drain_log_queue()
+    log_file.close()
+    write_queue.cancel_join_thread()  # a sentinel left in a full queue must not block exit
 
     duration_seconds = time.time() - processing_start_time
     minutes, seconds = divmod(duration_seconds, 60)
 
-    final_processed_count = sum(stats['completed'] for stats in gpu_stats.values())
+    final = {key: sum(stats[key] for stats in gpu_stats.values()) for key in ('completed',) + RESULTS}
+    clean_count = final['skipped'] + final['copied'] + final['reencoded']
 
     console.print("\n[--- [bold yellow]Session Paused / Complete[/bold yellow] ---]")
-    console.print(f"✅ Processed [bold]{final_processed_count:,}[/] new images this session in [bold]{int(minutes)} minutes and {seconds:.2f} seconds[/bold].")
+    console.print(f"✅ Processed [bold]{final['completed']:,}[/] new images this session in [bold]{int(minutes)} minutes and {seconds:.2f} seconds[/bold].")
+    console.print(f"   {final['inpainted']:,} had a watermark and were inpainted.")
+    if args.skip_clean: console.print(f"   {clean_count:,} had no detected watermark and were not written.")
+    else: console.print(f"   {clean_count:,} had no detected watermark: {final['copied']:,} copied unchanged, {final['reencoded']:,} re-encoded.")
+    if final['failed']: console.print(f"   [bold red]{final['failed']:,} failed[/] and will be retried in the next session.")
     console.print(f"✅ Clean images are saved in: [link=file://{args.output.resolve()}]{args.output.resolve()}[/link]")
 
 # ╰─────────────────────────────────────────────────────────────────────────╯

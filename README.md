@@ -27,11 +27,17 @@ Enjoy!
     ```bash
     python3 -m venv venv
     source venv/bin/activate
-    pip install rich ultralytics simple-lama-inpainting opencv-python torch --upgrade
+    pip install rich ultralytics simple-lama-inpainting opencv-python torch transformers --upgrade
     ```
+    `transformers` is only needed for DINOv3-YOLOv12 detector checkpoints (see below). On Windows, install a CUDA build of torch from https://pytorch.org/get-started/locally/ instead of the default PyPI wheel, which is CPU-only.
 4. Download [fancyfeast](https://huggingface.co/fancyfeast)'s custom [YOLOv11 watermark detection model](https://huggingface.co/spaces/fancyfeast/joycaption-watermark-detection) checkpoint from Hugging Face:
     ```bash
     wget https://huggingface.co/spaces/fancyfeast/joycaption-watermark-detection/resolve/main/yolo11x-train28-best.pt
+    ```
+
+5. Optional: download [corzent](https://huggingface.co/corzent)'s [YOLOv12x + DINOv3 watermark detection model](https://huggingface.co/corzent/yolov12x-dino3-watermark-detection). It was trained with the [DINOV3-YOLOV12](https://github.com/Sompote/DINOV3-YOLOV12) fork of ultralytics, and this project ships a small compatibility layer (`dino3_compat.py`) so it runs on stock ultralytics. It needs `transformers` and roughly twice the inference time of the YOLOv11 model.
+    ```bash
+    wget https://huggingface.co/corzent/yolov12x-dino3-watermark-detection/resolve/main/yolov12x-dino3-watermark-detection.pt
     ```
 
 # Usage instructions
@@ -39,6 +45,16 @@ Enjoy!
 **Basic usage**
 
     python3 watermark_remover.py -i /path/to/inputs -o /path/to/outputs -R
+
+**Processing each first-level subfolder into its own output folder (Windows)**
+
+    recursive_scan.bat D:\datasets --png -R
+
+This runs the script once per subfolder of `D:\datasets`, writing `D:\datasets\NAME` to `D:\datasets\_NAME`. All parameters after the folder are passed through unchanged. Subfolders whose name starts with `_` are skipped, so the command can be re-run and resumes per folder.
+
+**Using the DINOv3-YOLOv12 detector**
+
+    python3 watermark_remover.py -i /path/to/inputs -o /path/to/outputs -R -w yolov12x-dino3-watermark-detection.pt
 
 
 
@@ -79,6 +95,10 @@ Here is a detailed explanation of all available arguments:
 * **`--debug`** A flag that, if present, will save two intermediate images for each detected watermark into an `output/debug/` directory:
     1.  `_mask_raw.png`: The raw black and white mask.
     2.  `_mask_preview.png`: The mask overlaid in semi-transparent red on the original image.
+
+* **`--skip-clean`** `on|off`  
+    Controls what happens to images in which no watermark is detected. `on`, `yes` or `1` does not write them to the output folder. `off`, `no` or `0` writes them too, so the output folder is a complete copy of the input. JPEG and WebP files are then copied byte for byte, so they lose no quality. Lossless sources (PNG, BMP, TIFF) are re-encoded, and with `--png` every file is re-encoded to PNG. Images with a watermark are always written. Skipped images are still recorded in `.processing_log.txt`, so a resumed session does not scan them again. To write them later, delete the log file or use a different output folder. `--skip-clean` with no value means `on`.  
+    (Default: `on`)
 
 
 ## Notes
