@@ -1,0 +1,10 @@
+# On Windows, install a CUDA build of torch first (https://pytorch.org/get-started/locally/); the PyPI wheel is CPU-only.
+torch
+rich
+ultralytics
+simple-lama-inpainting
+opencv-python
+# Only for DINOv3-YOLOv12 detector checkpoints such as yolov12x-dino3-watermark-detection.pt
+transformers
+# Lossless JPEG crop for --trim; the wheel bundles libjpeg-turbo, so no separate install is needed
+turbojpeg

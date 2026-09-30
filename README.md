@@ -27,9 +27,9 @@ Enjoy!
     ```bash
     python3 -m venv venv
     source venv/bin/activate
-    pip install rich ultralytics simple-lama-inpainting opencv-python torch transformers --upgrade
+    pip install -r requirements.txt --upgrade
     ```
-    `transformers` is only needed for DINOv3-YOLOv12 detector checkpoints (see below). On Windows, install a CUDA build of torch from https://pytorch.org/get-started/locally/ instead of the default PyPI wheel, which is CPU-only.
+    `transformers` is only needed for DINOv3-YOLOv12 detector checkpoints (see below). `turbojpeg` is only needed for the lossless JPEG crop of `--trim`; its wheel includes libjpeg-turbo. On Windows, install a CUDA build of torch from https://pytorch.org/get-started/locally/ instead of the default PyPI wheel, which is CPU-only.
 4. Download [fancyfeast](https://huggingface.co/fancyfeast)'s custom [YOLOv11 watermark detection model](https://huggingface.co/spaces/fancyfeast/joycaption-watermark-detection) checkpoint from Hugging Face:
     ```bash
     wget https://huggingface.co/spaces/fancyfeast/joycaption-watermark-detection/resolve/main/yolo11x-train28-best.pt
@@ -45,6 +45,12 @@ Enjoy!
 **Basic usage**
 
     python3 watermark_remover.py -i /path/to/inputs -o /path/to/outputs -R
+
+**Cropping the watermark off instead of inpainting it**
+
+    python3 watermark_remover.py -i /path/to/inputs -o /path/to/outputs -R --trim --conf 0.5
+
+Use this when the watermarks are banners or credits along an edge. A cut through the photo is better than an inpainted guess. JPEG files are cropped losslessly. See `--trim` below.
 
 **Processing each first-level subfolder into its own output folder (Windows)**
 
@@ -89,6 +95,12 @@ Here is a detailed explanation of all available arguments:
 * **`--inpaint-max-size`** `<integer>`  
     LaMa does not inpaint the full image. It inpaints each watermark with a margin of context around it, and only the masked pixels are replaced. This option sets the longest side, in pixels, of such an area. A larger area is scaled down for inpainting, and the result is scaled back up. LaMa needs about 0.9 GB of VRAM per megapixel, so `0` (no limit) can overfill VRAM on large images.  
     (Default: `2048`)
+
+* **`--trim`** A flag that, if present, crops the watermark off instead of inpainting it. The image is cut to the largest rectangle that contains no detected watermark, including the `--dilate` margin. For example, a banner along the bottom edge removes a strip of that height from the bottom. A logo in a corner removes a strip from the side that costs fewer pixels. JPEG sources are cropped losslessly with libjpeg-turbo, unless `--png` is set. The kept pixels are not recompressed, and EXIF and ICC data are kept. A lossless crop must start on a JPEG block boundary, so the kept area can move inwards by up to 31 px (usually 8 or 16 px). Other formats, and all images with `--png`, are cropped and re-encoded. Every false positive also costs a strip of the image, so raise `--conf` until only real watermarks are detected.
+
+* **`--trim-min-keep`** `<fraction>`  
+    With `--trim`: if the rectangle keeps less than this fraction of the image area, the watermark is not near an edge, and the image is inpainted instead. `0` always trims.  
+    (Default: `0.75`)
 
 * **`-R, --recursive`** A flag that, if present, tells the script to search for images in all subdirectories of the input folder. If omitted, it will only process images in the top-level directory.
 

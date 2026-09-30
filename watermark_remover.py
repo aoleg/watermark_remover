@@ -79,6 +79,8 @@ def parse_cli_args():
     parser.add_argument("--conf", type=float, default=0.1, help="YOLO detection confidence threshold.")
     parser.add_argument("--dilate", type=int, default=15, help="Pixel amount to expand detected masks.")
     parser.add_argument("--inpaint-max-size", type=int, default=2048, help="Longest side, in pixels, of an area that LaMa inpaints in one pass. LaMa works on the watermark\nplus a margin of context, not on the full image. A larger area is scaled down for inpainting, and\nonly the masked pixels are scaled back up. LaMa needs about 0.9 GB of VRAM per megapixel, so\n0 (no limit) can overfill VRAM on large images. (Default: 2048)")
+    parser.add_argument("--trim", action="store_true", help="Crop the watermark off instead of inpainting it. The image is cut to the largest rectangle that\ncontains no detected watermark (with the --dilate margin). JPEG sources are cropped losslessly\nunless --png is set; the left and top edges then move inwards by up to 31 px to the next JPEG block.")
+    parser.add_argument("--trim-min-keep", type=float, default=0.75, metavar="FRACTION", help="With --trim: if the rectangle keeps less than this fraction of the image area, the watermark is\nnot near an edge, and the image is inpainted instead. 0 always trims. (Default: 0.75)")
     parser.add_argument("-R", "--recursive", action="store_true", help="Process images in subdirectories recursively.")
     parser.add_argument("--cpu-workers", type=int, default=os.cpu_count(), help="Total number of CPU processes for writing images to disk.")
     parser.add_argument("--debug", action="store_true", help="Save intermediate mask_raw and mask_preview images for debugging.")
@@ -158,6 +160,50 @@ def write_image(path: pathlib.Path, img) -> bool:
     if ok: encoded.tofile(str(path))
     return ok
 
+def largest_clear_rect(boxes, width: int, height: int, max_boxes: int = 20):
+    """Returns the largest (x1, y1, x2, y2) rectangle of the image that overlaps no box, or None.
+    Each side of the best rectangle lies on the image border or on a box edge, so only those candidates are tested."""
+    import numpy as np
+    boxes = np.asarray(boxes, dtype=np.int64).reshape(-1, 4)
+    if len(boxes) > max_boxes: return None  # a tiled watermark; no useful rectangle is left anyway
+    lefts, rights = np.r_[0, boxes[:, 2]], np.r_[width, boxes[:, 0]]
+    tops, bottoms = np.r_[0, boxes[:, 3]], np.r_[height, boxes[:, 1]]
+    L, R, T, B = np.meshgrid(lefts, rights, tops, bottoms, indexing="ij")
+    L, R, T, B = L.ravel(), R.ravel(), T.ravel(), B.ravel()
+    area = np.clip(R - L, 0, None) * np.clip(B - T, 0, None)
+    hits = ((boxes[:, 0][None] < R[:, None]) & (L[:, None] < boxes[:, 2][None]) &
+            (boxes[:, 1][None] < B[:, None]) & (T[:, None] < boxes[:, 3][None])).any(axis=1)
+    area[hits] = 0
+    best = int(area.argmax())
+    return (int(L[best]), int(T[best]), int(R[best]), int(B[best])) if area[best] > 0 else None
+
+def crop_jpeg_losslessly(path: pathlib.Path, rect):
+    """Crops a JPEG in the DCT domain, so the kept pixels are not recompressed, and keeps EXIF, ICC and other markers.
+    rect is (x1, y1, x2, y2) as OpenCV shows the image, that is after EXIF rotation, while the crop applies to the
+    stored image; it is mapped back first. The stored left and top edges must lie on an MCU boundary (8 to 32 px),
+    so they move inwards to the next boundary. Returns the new file's bytes, or None if a lossless crop is not possible."""
+    import io, turbojpeg
+    from PIL import Image
+    data = path.read_bytes()
+    header = turbojpeg.decompress_header(data)
+    w, h = header["width"], header["height"]
+    try: orientation = Image.open(io.BytesIO(data)).getexif().get(0x0112, 1)
+    except Exception: orientation = 1
+    x1, y1, x2, y2 = rect
+    stored = {  # displayed edges -> stored edges, per EXIF orientation
+        1: (x1, y1, x2, y2),         2: (w - x2, y1, w - x1, y2),         3: (w - x2, h - y2, w - x1, h - y1),
+        4: (x1, h - y2, x2, h - y1), 5: (y1, x1, y2, x2),                 6: (y1, h - x2, y2, h - x1),
+        7: (w - y2, h - x2, w - y1, h - x1),                              8: (w - y2, x1, w - y1, x2),
+    }.get(orientation)
+    mcu = {turbojpeg.SAMP.Y444: (8, 8), turbojpeg.SAMP.GRAY: (8, 8), turbojpeg.SAMP.Y422: (16, 8), turbojpeg.SAMP.Y420: (16, 16),
+           turbojpeg.SAMP.Y440: (8, 16), turbojpeg.SAMP.Y411: (32, 8), turbojpeg.SAMP.Y441: (8, 32)}.get(header["subsamp"])
+    if stored is None or mcu is None: return None
+    sx1, sy1, sx2, sy2 = stored
+    sx1, sy1 = -(-sx1 // mcu[0]) * mcu[0], -(-sy1 // mcu[1]) * mcu[1]
+    if sx2 <= sx1 or sy2 <= sy1: return None
+    if (sx1, sy1, sx2, sy2) == (0, 0, w, h): return data
+    try: return turbojpeg.transform(data, x=sx1, y=sy1, w=sx2 - sx1, h=sy2 - sy1, crop=True, perfect=False)
+    except Exception: return None
 # ╰─────────────────────────────────────────────────────────────────────────╯
 
 # ╭─────────────────────── Custom Rich Progress Columns ───────────────────────╮
@@ -252,8 +298,19 @@ def gpu_worker_process(gpu_id: int, image_paths: list, write_queue: mp.Queue, st
                     # Named after the full input name, so a.jpg and a.png in one folder get separate masks.
                     write_queue.put((debug_dir / f"{path.name}_mask_raw.png", mask, None))
                     write_queue.put((debug_dir / f"{path.name}_mask_preview.png", mask_preview, None))
-                result_bgr = inpaint_areas(lama_model, img_bgr, mask, args.inpaint_max_size)
-                write_queue.put((output_path, result_bgr, relative_path.as_posix())); result = "inpainted"
+                rect = None
+                if args.trim:
+                    _, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+                    rect = largest_clear_rect([(x, y, x + w, y + h) for x, y, w, h, _ in stats[1:]], mask.shape[1], mask.shape[0])
+                    if rect and (rect[2] - rect[0]) * (rect[3] - rect[1]) < args.trim_min_keep * mask.size: rect = None
+                if rect:
+                    x1, y1, x2, y2 = rect
+                    if path.suffix.lower() in (".jpg", ".jpeg") and not args.png: data = ("jpeg_crop", path, rect)  # the writer crops the file itself
+                    else: data = img_bgr[y1:y2, x1:x2]
+                    write_queue.put((output_path, data, relative_path.as_posix())); result = "trimmed"
+                else:
+                    result_bgr = inpaint_areas(lama_model, img_bgr, mask, args.inpaint_max_size)
+                    write_queue.put((output_path, result_bgr, relative_path.as_posix())); result = "inpainted"
             elif args.skip_clean:
                 result = "skipped"  # nothing to write; the main process logs the file so a resumed session skips it
             elif path.suffix.lower().lstrip('.') in LOSSY_EXTS and not args.png:
@@ -274,11 +331,18 @@ def cpu_writer_process(write_queue: mp.Queue, log_queue: mp.Queue, output_dir: p
         try:
             item = write_queue.get()
             if item is None: break
-            path, data, log_key = item  # data is an image array to encode, a source path to copy; log_key is the input-relative path, or None for debug images
+            path, data, log_key = item  # data is an image array to encode, a source path to copy or ("jpeg_crop", source path, rect); log_key is the input-relative path, or None for debug images
             if path.parent not in created_dirs:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 created_dirs.add(path.parent)
             if isinstance(data, pathlib.Path): shutil.copy2(data, path); written = True
+            elif isinstance(data, tuple):
+                _, source, (x1, y1, x2, y2) = data
+                cropped = crop_jpeg_losslessly(source, (x1, y1, x2, y2))
+                if cropped is not None: path.write_bytes(cropped); written = True
+                else:
+                    log_queue.put(("warning", f"No lossless crop possible, re-encoded: {source}"))
+                    img = read_image(source); written = img is not None and write_image(path, img[y1:y2, x1:x2])
             else: written = write_image(path, data)
             if not written: log_queue.put(("error", f"Could not encode {path}"))
             elif log_key is not None: log_queue.put(("done", log_key))
@@ -343,7 +407,7 @@ def main():
         SpeedColumn(), "•", EstimatedTimeRemainingColumn(), console=console
     )
     progress_task = progress.add_task("New Images", total=len(images_to_process))
-    RESULTS = ("inpainted", "skipped", "copied", "reencoded", "failed")
+    RESULTS = ("inpainted", "trimmed", "skipped", "copied", "reencoded", "failed")
     gpu_stats = {gpu_id: {'completed': 0, **dict.fromkeys(RESULTS, 0), 'start_time': time.time()} for gpu_id in gpu_ids}
     clean_label = "skipped" if args.skip_clean else "written"
 
@@ -358,7 +422,8 @@ def main():
             elapsed = time.time() - stats['start_time']
             rate = stats['completed'] / elapsed if elapsed > 1 else 0.0
             clean = stats['skipped'] + stats['copied'] + stats['reencoded']
-            gpu_table.add_row(f"[bold]GPU {gpu_id}[/]", f"{stats['completed']:,} images", f"{stats['inpainted']:,} inpainted", f"{clean:,} {clean_label}", f"{rate:.2f} img/s")
+            marked = f"{stats['trimmed']:,} trimmed, {stats['inpainted']:,} inpainted" if args.trim else f"{stats['inpainted']:,} inpainted"
+            gpu_table.add_row(f"[bold]GPU {gpu_id}[/]", f"{stats['completed']:,} images", marked, f"{clean:,} {clean_label}", f"{rate:.2f} img/s")
 
         display_grid = Table.grid(padding=(0,0,1,0))
         display_grid.add_row(Panel(gpu_table, title="[bold]GPU Worker Status[/bold]", border_style="green"))
@@ -379,6 +444,7 @@ def main():
             while True:
                 kind, value = log_queue.get_nowait()
                 if kind == "done": log_file.write(f"{value}\n")
+                elif kind == "warning": report(f"⚠️ [yellow]WARNING:[/] {value}", live_console=False)
                 else: report(f"❌ [bold red]WRITE ERROR:[/bold red] {value}", live_console=False)
         except queue.Empty:
             pass
@@ -443,7 +509,8 @@ def main():
 
     console.print("\n[--- [bold yellow]Session Paused / Complete[/bold yellow] ---]")
     console.print(f"✅ Processed [bold]{final['completed']:,}[/] new images this session in [bold]{int(minutes)} minutes and {seconds:.2f} seconds[/bold].")
-    console.print(f"   {final['inpainted']:,} had a watermark and were inpainted.")
+    if args.trim: console.print(f"   {final['trimmed'] + final['inpainted']:,} had a watermark: {final['trimmed']:,} were trimmed, {final['inpainted']:,} inpainted (watermark too far from an edge).")
+    else: console.print(f"   {final['inpainted']:,} had a watermark and were inpainted.")
     if args.skip_clean: console.print(f"   {clean_count:,} had no detected watermark and were not written.")
     else: console.print(f"   {clean_count:,} had no detected watermark: {final['copied']:,} copied unchanged, {final['reencoded']:,} re-encoded.")
     if final['failed']: console.print(f"   [bold red]{final['failed']:,} failed[/] and will be retried in the next session.")
