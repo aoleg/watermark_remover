@@ -86,6 +86,10 @@ Here is a detailed explanation of all available arguments:
     The number of pixels to expand (dilate) the detected watermark mask. This is useful for ensuring the inpainting model covers any faint "glow" or aliasing around the edges of a watermark. Set to `0` to disable.  
     (Default: `15`)
 
+* **`--inpaint-max-size`** `<integer>`  
+    LaMa does not inpaint the full image. It inpaints each watermark with a margin of context around it, and only the masked pixels are replaced. This option sets the longest side, in pixels, of such an area. A larger area is scaled down for inpainting, and the result is scaled back up. LaMa needs about 0.9 GB of VRAM per megapixel, so `0` (no limit) can overfill VRAM on large images.  
+    (Default: `2048`)
+
 * **`-R, --recursive`** A flag that, if present, tells the script to search for images in all subdirectories of the input folder. If omitted, it will only process images in the top-level directory.
 
 * **`--cpu-workers`** `<integer>`  

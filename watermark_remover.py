@@ -78,6 +78,7 @@ def parse_cli_args():
     parser.add_argument("-w", "--weights", type=pathlib.Path, default=pathlib.Path("yolo11x-train28-best.pt"), help="Path to the YOLO detector weights (.pt). Supports plain ultralytics checkpoints such as\nyolo11x-train28-best.pt and DINOv3-YOLOv12 checkpoints such as yolov12x-dino3-watermark-detection.pt.")
     parser.add_argument("--conf", type=float, default=0.1, help="YOLO detection confidence threshold.")
     parser.add_argument("--dilate", type=int, default=15, help="Pixel amount to expand detected masks.")
+    parser.add_argument("--inpaint-max-size", type=int, default=2048, help="Longest side, in pixels, of an area that LaMa inpaints in one pass. LaMa works on the watermark\nplus a margin of context, not on the full image. A larger area is scaled down for inpainting, and\nonly the masked pixels are scaled back up. LaMa needs about 0.9 GB of VRAM per megapixel, so\n0 (no limit) can overfill VRAM on large images. (Default: 2048)")
     parser.add_argument("-R", "--recursive", action="store_true", help="Process images in subdirectories recursively.")
     parser.add_argument("--cpu-workers", type=int, default=os.cpu_count(), help="Total number of CPU processes for writing images to disk.")
     parser.add_argument("--debug", action="store_true", help="Save intermediate mask_raw and mask_preview images for debugging.")
@@ -143,6 +144,20 @@ def png_output_renames(relative_paths: list) -> dict:
         taken.add(out.as_posix().lower())
         if out != rel.with_suffix(".png"): renames[rel.as_posix()] = out.as_posix()
     return renames
+
+# cv2.imread and cv2.imwrite pass the path to the C runtime as narrow bytes, so on Windows they fail on any name
+# outside the ANSI code page (and even on Cyrillic under code page 1251). Python opens the file; OpenCV only decodes.
+def read_image(path: pathlib.Path):
+    import cv2, numpy as np
+    data = np.fromfile(str(path), dtype=np.uint8)
+    return cv2.imdecode(data, cv2.IMREAD_COLOR) if data.size else None
+
+def write_image(path: pathlib.Path, img) -> bool:
+    import cv2
+    ok, encoded = cv2.imencode(path.suffix, img)
+    if ok: encoded.tofile(str(path))
+    return ok
+
 # ╰─────────────────────────────────────────────────────────────────────────╯
 
 # ╭─────────────────────── Custom Rich Progress Columns ───────────────────────╮
@@ -161,6 +176,45 @@ class EstimatedTimeRemainingColumn(TimeRemainingColumn):
 # ╰─────────────────────────────────────────────────────────────────────────╯
 
 # ╭─────────────────────── GPU & CPU Worker Implementations ───────────────────────╮
+def inpaint_areas(lama_model, img_bgr, mask, max_size: int):
+    """Inpaints each masked area in a crop with context around it, instead of the full image. LaMa's VRAM use grows
+    with the pixel count, so a 40 MP image does not fit in 32 GB. A crop whose longest side exceeds max_size is scaled
+    down for LaMa and its result scaled back up. Only masked pixels are replaced; every other pixel stays unchanged."""
+    import cv2, numpy as np
+    from PIL import Image
+    H, W = mask.shape
+    _, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    rects = []
+    for x, y, w, h, _ in stats[1:]:
+        margin = max(128, max(w, h) // 2)  # LaMa fills the hole from its surroundings, so give it some
+        rects.append([max(0, x - margin), max(0, y - margin), min(W, x + w + margin), min(H, y + h + margin)])
+    merged = True  # overlapping crops are merged, so no crop sees an unfilled part of another watermark as context
+    while merged:
+        merged = False
+        for i in range(len(rects)):
+            for j in range(i + 1, len(rects)):
+                a, b = rects[i], rects[j]
+                if a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]:
+                    rects[i] = [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])]; del rects[j]; merged = True; break
+            if merged: break
+    result = img_bgr.copy()
+    for x1, y1, x2, y2 in rects:
+        crop, crop_mask = img_bgr[y1:y2, x1:x2], mask[y1:y2, x1:x2]
+        h, w = crop_mask.shape
+        scale = min(1.0, max_size / max(h, w)) if max_size > 0 else 1.0
+        if scale < 1.0:
+            size = (max(8, round(w * scale)), max(8, round(h * scale)))
+            crop = cv2.resize(crop, size, interpolation=cv2.INTER_AREA)
+            lama_mask = (cv2.resize(crop_mask, size, interpolation=cv2.INTER_AREA) > 0).astype(np.uint8) * 255  # any coverage counts
+        else:
+            lama_mask = crop_mask
+        filled = np.array(lama_model(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)), Image.fromarray(lama_mask)))
+        filled = cv2.cvtColor(filled[:crop.shape[0], :crop.shape[1]], cv2.COLOR_RGB2BGR)  # LaMa pads to a multiple of 8
+        if scale < 1.0: filled = cv2.resize(filled, (w, h), interpolation=cv2.INTER_CUBIC)
+        selected = crop_mask > 0
+        result[y1:y2, x1:x2][selected] = filled[selected]
+    return result
+
 def gpu_worker_process(gpu_id: int, image_paths: list, write_queue: mp.Queue, status_queue: mp.Queue, args: argparse.Namespace):
     """The core function executed by each GPU worker process."""
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -168,7 +222,6 @@ def gpu_worker_process(gpu_id: int, image_paths: list, write_queue: mp.Queue, st
     import torch, cv2, numpy as np
     from ultralytics import YOLO
     from simple_lama_inpainting import SimpleLama
-    from PIL import Image
     import dino3_compat  # lets stock ultralytics load DINOv3-YOLOv12 checkpoints; no-op for plain YOLO weights
     dino3_compat.register()
     try:
@@ -181,7 +234,7 @@ def gpu_worker_process(gpu_id: int, image_paths: list, write_queue: mp.Queue, st
             relative_path = path.relative_to(args.input)
             output_path = args.output / relative_path
             if args.png: output_path = args.output / args.png_renames.get(relative_path.as_posix(), relative_path.with_suffix(".png").as_posix())
-            img_bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            img_bgr = read_image(path)
             if img_bgr is None:
                 status_queue.put({"type": "log", "message": f"Could not read image: {path}"})
                 status_queue.put({"type": "gpu_progress", "gpu_id": gpu_id, "result": "failed"}); continue
@@ -199,7 +252,7 @@ def gpu_worker_process(gpu_id: int, image_paths: list, write_queue: mp.Queue, st
                     # Named after the full input name, so a.jpg and a.png in one folder get separate masks.
                     write_queue.put((debug_dir / f"{path.name}_mask_raw.png", mask, None))
                     write_queue.put((debug_dir / f"{path.name}_mask_preview.png", mask_preview, None))
-                result_bgr = cv2.cvtColor(np.array(lama_model(Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)), Image.fromarray(mask))), cv2.COLOR_RGB2BGR)
+                result_bgr = inpaint_areas(lama_model, img_bgr, mask, args.inpaint_max_size)
                 write_queue.put((output_path, result_bgr, relative_path.as_posix())); result = "inpainted"
             elif args.skip_clean:
                 result = "skipped"  # nothing to write; the main process logs the file so a resumed session skips it
@@ -209,28 +262,30 @@ def gpu_worker_process(gpu_id: int, image_paths: list, write_queue: mp.Queue, st
                 write_queue.put((output_path, img_bgr, relative_path.as_posix())); result = "reencoded"
             status_queue.put({"type": "gpu_progress", "gpu_id": gpu_id, "result": result, "key": relative_path.as_posix()})
         except Exception as e:
+            if isinstance(e, torch.OutOfMemoryError): torch.cuda.empty_cache()
             status_queue.put({"type": "error", "message": f"Error on GPU {gpu_id} processing {path.name}: {e}"})
             status_queue.put({"type": "gpu_progress", "gpu_id": gpu_id, "result": "failed"})
 
 def cpu_writer_process(write_queue: mp.Queue, log_queue: mp.Queue, output_dir: pathlib.Path):
     """A dedicated I/O process that saves files and reports success for checkpointing."""
-    import cv2, shutil
+    import shutil
     created_dirs = set()
     while True:
         try:
             item = write_queue.get()
             if item is None: break
-            path, data, log_key = item  # data is an image array to encode or a source path to copy; log_key is the input-relative path, or None for debug images
+            path, data, log_key = item  # data is an image array to encode, a source path to copy; log_key is the input-relative path, or None for debug images
             if path.parent not in created_dirs:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 created_dirs.add(path.parent)
             if isinstance(data, pathlib.Path): shutil.copy2(data, path); written = True
-            else: written = cv2.imwrite(str(path), data)
-            if written and log_key is not None:
-                log_queue.put(log_key)
+            else: written = write_image(path, data)
+            if not written: log_queue.put(("error", f"Could not encode {path}"))
+            elif log_key is not None: log_queue.put(("done", log_key))
         except (KeyboardInterrupt, SystemExit):
             break
-        except Exception: continue
+        except Exception as e:
+            log_queue.put(("error", f"Could not write {path}: {e}"))
 # ╰─────────────────────────────────────────────────────────────────────────╯
 
 # ╭────────────────────────────── Main Driver ──────────────────────────────╮
@@ -312,10 +367,19 @@ def main():
 
     log_file = open(log_file_path, "a", encoding="utf-8")
 
+    # The live display runs on the alternate screen, which is discarded on exit, so problems are also kept for the summary.
+    problems = []
+    def report(message: str, live_console=True):
+        problems.append(message)
+        if live_console: console.log(message)
+
     def drain_log_queue():
         """Appends every file the CPU writers have finished to the checkpoint log."""
         try:
-            while True: log_file.write(f"{log_queue.get_nowait()}\n")
+            while True:
+                kind, value = log_queue.get_nowait()
+                if kind == "done": log_file.write(f"{value}\n")
+                else: report(f"❌ [bold red]WRITE ERROR:[/bold red] {value}", live_console=False)
         except queue.Empty:
             pass
         log_file.flush()
@@ -335,8 +399,8 @@ def main():
                             gpu_stats[msg["gpu_id"]][msg["result"]] += 1
                             total_completed += 1
                             if msg["result"] == "skipped": log_file.write(f"{msg['key']}\n")
-                        elif msg["type"] == "error": console.log(f"❌ [bold red]ERROR:[/bold red] {msg['message']}")
-                        elif msg["type"] == "log": console.log(f"⚠️ [yellow]WARNING:[/] {msg['message']}")
+                        elif msg["type"] == "error": report(f"❌ [bold red]ERROR:[/bold red] {msg['message']}")
+                        elif msg["type"] == "log": report(f"⚠️ [yellow]WARNING:[/] {msg['message']}")
                 except queue.Empty:
                     pass
 
@@ -383,6 +447,10 @@ def main():
     if args.skip_clean: console.print(f"   {clean_count:,} had no detected watermark and were not written.")
     else: console.print(f"   {clean_count:,} had no detected watermark: {final['copied']:,} copied unchanged, {final['reencoded']:,} re-encoded.")
     if final['failed']: console.print(f"   [bold red]{final['failed']:,} failed[/] and will be retried in the next session.")
+    if problems:
+        console.print(f"   [bold red]{len(problems):,} problems[/] were reported; files that were not written will be retried in the next session:")
+        for message in problems[:20]: console.print(f"     {message}")
+        if len(problems) > 20: console.print(f"     ... and {len(problems) - 20:,} more")
     console.print(f"✅ Clean images are saved in: [link=file://{args.output.resolve()}]{args.output.resolve()}[/link]")
 
 # ╰─────────────────────────────────────────────────────────────────────────╯
